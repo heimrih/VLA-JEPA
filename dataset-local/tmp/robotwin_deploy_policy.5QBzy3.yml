@@ -1,0 +1,12 @@
+policy_name: model2robotwin_interface
+task_name: null
+task_config: null
+ckpt_setting: null
+seed: null
+instruction_type: unseen
+
+host: "127.0.0.1"
+port: 48361
+unnorm_key: "new_embodiment"
+action_mode: "abs"
+normalization_mode: "min_max"

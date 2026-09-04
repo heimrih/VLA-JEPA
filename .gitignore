@@ -1,0 +1,12 @@
+checkpoints/
+dataset/
+/model/
+wandb/
+output_log/
+*.log
+__pycache__/
+*.pyc
+LIBERO/
+RoboTwin/
+results/
+/Pretrain/

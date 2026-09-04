@@ -1,0 +1,737 @@
+# Copyright 2025 starVLA community. All rights reserved.
+# Licensed under the MIT License, Version 1.0 (the "License"); 
+# Implemented by [Jinhui YE / HKUST University] in [2025].
+
+
+"""
+StarVLA’s trainer is built directly on native PyTorch + Accelerate + DeepSpeed, keeping the loop explicit and easy to hack.
+Conventions:
+1. Store runtime state in dicts where possible (simplifies data info, procesing info, config, etc).  
+2. Use multiple dataloaders to adapt heterogeneous data types / task mixtures.  
+3. Put each training strategy in its own `trainer_*.py` file (avoid large if‑else chains).  
+"""
+import warnings
+
+# 全局忽略所有警告
+warnings.filterwarnings("ignore")
+from torch.utils.tensorboard import SummaryWriter
+
+# Standard Library
+import argparse
+import json
+import os
+from pathlib import Path
+from typing import Tuple
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+import time
+
+# Third-Party Libraries
+import torch
+import torch.distributed as dist
+import wandb
+import yaml
+from accelerate import Accelerator, DeepSpeedPlugin
+from accelerate.logging import get_logger
+from accelerate.utils import GradientAccumulationPlugin, set_seed
+from omegaconf import OmegaConf
+from tqdm import tqdm
+from transformers import AutoProcessor, get_scheduler
+
+# Local Modules
+from starVLA.training.trainer_utils.trainer_tools import normalize_dotlist_args
+from starVLA.model.framework import build_framework
+from starVLA.training.trainer_utils.trainer_tools import TrainerUtils
+from starVLA.training.trainer_utils.trainer_tools import build_param_lr_groups
+
+deepspeed_plugin = DeepSpeedPlugin()
+accelerator = None
+
+# Sane Defaults
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+# Initialize Overwatch =>> Wraps `logging.Logger`
+from accelerate.logging import get_logger
+
+logger = get_logger(__name__)
+
+
+def load_fast_tokenizer():
+    fast_tokenizer = AutoProcessor.from_pretrained("physical-intelligence/fast", trust_remote_code=True)
+    return fast_tokenizer
+
+
+def setup_directories(cfg) -> Path:
+    """create output directory and save config"""
+    cfg.output_dir = os.path.join(cfg.run_root_dir, cfg.run_id)
+    output_dir = Path(cfg.output_dir)
+
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        # create output directory and checkpoint directory
+        os.makedirs(output_dir, exist_ok=True)
+        os.makedirs(output_dir / "checkpoints", exist_ok=True)
+
+        # save config
+        OmegaConf.save(cfg, output_dir / "config.yaml")
+        with open(output_dir / "config.yaml", "r") as f_yaml, open(output_dir / "config.json", "w") as f_json:
+            yaml_cfg = yaml.safe_load(f_yaml)
+            json.dump(yaml_cfg, f_json, indent=2)
+
+    return output_dir
+
+
+def build_model(cfg) -> torch.nn.Module:
+    """build model framework"""
+    logger.info(f"Loading Base VLM `{cfg.framework.qwenvl.base_vlm}` from ID/Path")
+    model = build_framework(cfg)
+
+    return model
+
+
+def validate_config(cfg) -> None:
+    """Fail early on action/state contracts shared by loading and inference."""
+    action_cfg = cfg.framework.action_model
+    expected_horizon = int(action_cfg.future_action_window_size) + 1
+    configured_horizon = int(action_cfg.action_horizon)
+    if configured_horizon != expected_horizon:
+        raise ValueError(
+            "framework.action_model.action_horizon must equal "
+            "future_action_window_size + 1; "
+            f"got {configured_horizon} and {action_cfg.future_action_window_size}."
+        )
+
+    with_state = bool(cfg.datasets.vla_data.get("with_state", False))
+    state_dim = int(action_cfg.get("state_dim", 0))
+    if with_state and state_dim <= 0:
+        raise ValueError(
+            "datasets.vla_data.with_state is enabled, but "
+            "framework.action_model.state_dim is not positive."
+        )
+
+    is_resume = bool(cfg.trainer.get("is_resume", False))
+    resume_from_checkpoint = cfg.trainer.get("resume_from_checkpoint", None)
+    if is_resume:
+        if not resume_from_checkpoint:
+            raise ValueError(
+                "trainer.resume_from_checkpoint must be set when trainer.is_resume is true."
+            )
+        if not os.path.isdir(resume_from_checkpoint):
+            raise ValueError(
+                "trainer.resume_from_checkpoint must point to an Accelerate state "
+                f"directory; not found: {resume_from_checkpoint}"
+            )
+
+
+# here changes need to 📦 encapsulate Dataloader
+from starVLA.dataloader import build_dataloader
+
+
+def prepare_data(cfg, accelerator, output_dir) -> Tuple[DataLoader, DataLoader]:
+    """prepare training data"""
+    # VLA data loader
+    logger.info(f"Creating VLA Dataset with Mixture `{cfg.datasets.vla_data.data_mix}`")
+    vla_train_dataloader = build_dataloader(cfg=cfg, dataset_py=cfg.datasets.vla_data.dataset_py)
+
+    accelerator.dataloader_config.dispatch_batches = False
+    dist.barrier()
+
+    return vla_train_dataloader
+
+
+def setup_optimizer_and_scheduler(model, cfg) -> Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler._LRScheduler]:
+    """set optimizer and scheduler"""
+    # initialize optimizer
+    param_groups = build_param_lr_groups(model=model, cfg=cfg)
+    optimizer = torch.optim.AdamW(
+        param_groups,
+        lr=cfg.trainer.learning_rate.base,
+        betas=tuple(cfg.trainer.optimizer.betas),
+        weight_decay=cfg.trainer.optimizer.weight_decay,
+        eps=cfg.trainer.optimizer.eps,
+    )
+
+    # print optimizer group info
+    if dist.is_initialized() and dist.get_rank() == 0:
+        for i, group in enumerate(optimizer.param_groups):
+            logger.info(f"LR Group {group['name']}: lr={group['lr']}, num_params={len(group['params'])}")
+
+    # initialize learning rate scheduler
+    lr_scheduler = get_scheduler(
+        name=cfg.trainer.lr_scheduler_type,
+        optimizer=optimizer,
+        num_warmup_steps=cfg.trainer.num_warmup_steps,
+        num_training_steps=cfg.trainer.max_train_steps,
+        scheduler_specific_kwargs=cfg.trainer.scheduler_specific_kwargs,  # minimum learning rate
+    )
+
+    return optimizer, lr_scheduler
+
+
+class VLATrainer(TrainerUtils):
+    def __init__(self, cfg, model, vla_train_dataloader, optimizer, lr_scheduler, accelerator):
+        self.config = cfg
+        self.model = model
+        self.vla_train_dataloader = vla_train_dataloader
+        self.optimizer = optimizer
+        self.lr_scheduler = lr_scheduler
+        self.accelerator = accelerator
+        self.writer = SummaryWriter(log_dir=os.path.join(cfg.run_root_dir, cfg.run_id, "tensorboard"))  # 保存目录
+
+        # training status tracking
+        self.completed_steps = 0
+        self.micro_batches_consumed = 0
+        self.main_process_eval_batches_consumed = 0
+        self.vla_epoch_count = 0
+        self.wandb_run_id = None
+        self.total_batch_size = self._calculate_total_batch_size()
+
+    def prepare_training(self):
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        seed = self.config.seed + rank if hasattr(self.config, "seed") else rank + 3047
+        set_seed(seed)
+
+        # A full resume restores the model below through Accelerator. Loading the
+        # initialization checkpoint first is unnecessary and can be incompatible
+        # with embodiment-specific layers.
+        is_resume = bool(self.config.trainer.get("is_resume", False))
+        if (
+            not is_resume
+            and hasattr(self.config.trainer, "pretrained_checkpoint")
+            and self.config.trainer.pretrained_checkpoint
+        ):
+            pretrained_checkpoint = self.config.trainer.pretrained_checkpoint
+            reload_modules = (
+                self.config.trainer.reload_modules if hasattr(self.config.trainer, "reload_modules") else None
+            )
+            self.model = self.load_pretrained_backbones(self.model, pretrained_checkpoint, reload_modules=reload_modules)
+
+        # freeze parameters
+        freeze_modules = (
+            self.config.trainer.freeze_modules
+            if (self.config and hasattr(self.config.trainer, "freeze_modules"))
+            else None
+        )
+        self.model = self.freeze_backbones(self.model, freeze_modules=freeze_modules)
+
+        #  print model trainable parameters:
+        self.print_trainable_parameters(self.model)
+
+        # initialize distributed training components
+        self.model, self.optimizer, self.vla_train_dataloader, self.lr_scheduler = self.setup_distributed_training(
+            self.accelerator,  # must be the first param
+            self.model,
+            self.optimizer,
+            self.vla_train_dataloader,
+            self.lr_scheduler,
+        )
+
+        self._init_checkpointing()
+        self._init_wandb()
+
+    def _calculate_total_batch_size(self):
+        """calculate global batch size"""
+        return (
+            self.config.datasets.vla_data.per_device_batch_size
+            * self.accelerator.num_processes
+            * self.accelerator.gradient_accumulation_steps
+        )
+
+    def _init_wandb(self):
+        """initialize Weights & Biases"""
+        if self.accelerator.is_main_process:
+            init_kwargs = {}
+            if self.wandb_run_id:
+                init_kwargs.update(id=self.wandb_run_id, resume="allow")
+            run = wandb.init(
+                name=self.config.run_id,
+                dir=os.path.join(self.config.output_dir, "wandb"),
+                project=getattr(self.config, "wandb_project", "starVLA"),
+                entity=getattr(self.config, "wandb_entity", None),
+                group="vla-train",
+                **init_kwargs,
+            )
+            self.wandb_run_id = run.id
+
+    def _init_checkpointing(self):
+        """initialize checkpoint directory"""
+        self.checkpoint_dir = os.path.join(self.config.output_dir, "checkpoints")
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+
+        # resume training state
+        if bool(self.config.trainer.get("is_resume", False)):
+            self._load_checkpoint(self.config.trainer.resume_from_checkpoint)
+
+    def _load_checkpoint(self, checkpoint_path):
+        """Restore distributed training state and trainer progress."""
+        checkpoint_path = Path(checkpoint_path)
+        metadata_path = checkpoint_path / "trainer_state.json"
+        if not metadata_path.is_file():
+            raise FileNotFoundError(
+                "Resume metadata is missing. Use a *_state directory produced by "
+                f"the resumable trainer, not a model-only .pt file: {metadata_path}"
+            )
+
+        with open(metadata_path, "r") as f:
+            trainer_state = json.load(f)
+
+        saved_world_size = int(trainer_state.get("num_processes", self.accelerator.num_processes))
+        saved_accumulation = int(
+            trainer_state.get(
+                "gradient_accumulation_steps",
+                self.config.trainer.gradient_accumulation_steps,
+            )
+        )
+        saved_per_device_batch = int(
+            trainer_state.get(
+                "per_device_batch_size",
+                self.config.datasets.vla_data.per_device_batch_size,
+            )
+        )
+        saved_batches_per_epoch = int(
+            trainer_state.get("batches_per_epoch", len(self.vla_train_dataloader))
+        )
+        if saved_world_size != self.accelerator.num_processes:
+            raise ValueError(
+                f"Resume requires {saved_world_size} processes, but this run has "
+                f"{self.accelerator.num_processes}."
+            )
+        if saved_accumulation != int(self.config.trainer.gradient_accumulation_steps):
+            raise ValueError(
+                "gradient_accumulation_steps must match the saved run; "
+                f"checkpoint={saved_accumulation}, "
+                f"current={self.config.trainer.gradient_accumulation_steps}."
+            )
+        if saved_per_device_batch != int(self.config.datasets.vla_data.per_device_batch_size):
+            raise ValueError(
+                "per_device_batch_size must match the saved run; "
+                f"checkpoint={saved_per_device_batch}, "
+                f"current={self.config.datasets.vla_data.per_device_batch_size}."
+            )
+        if saved_batches_per_epoch != len(self.vla_train_dataloader):
+            raise ValueError(
+                "The dataloader length changed, so its saved position cannot be restored; "
+                f"checkpoint={saved_batches_per_epoch}, "
+                f"current={len(self.vla_train_dataloader)}."
+            )
+
+        self.accelerator.load_state(str(checkpoint_path))
+        self.completed_steps = int(trainer_state["completed_steps"])
+        self.micro_batches_consumed = int(
+            trainer_state.get(
+                "micro_batches_consumed",
+                self.completed_steps * self.config.trainer.gradient_accumulation_steps,
+            )
+        )
+        self.main_process_eval_batches_consumed = int(
+            trainer_state.get("main_process_eval_batches_consumed", 0)
+        )
+        self.vla_epoch_count = int(trainer_state.get("vla_epoch_count", 0))
+        self.wandb_run_id = trainer_state.get("wandb_run_id")
+        self.accelerator.print(
+            f"Resumed from {checkpoint_path} at optimizer step "
+            f"{self.completed_steps} ({self.micro_batches_consumed} micro-batches)"
+        )
+
+    def _save_checkpoint(self):
+        """Save evaluation weights plus resumable Accelerate/DeepSpeed state."""
+        checkpoint_path = os.path.join(self.checkpoint_dir, f"steps_{self.completed_steps}")
+        state_checkpoint_path = checkpoint_path + "_state"
+
+        # DeepSpeed optimizer shards and RNG state require participation from
+        # every rank. Do not put save_state inside an is_main_process guard.
+        self.accelerator.wait_for_everyone()
+        self.accelerator.save_state(state_checkpoint_path)
+        self.accelerator.wait_for_everyone()
+
+        # Keep the existing consolidated model file for evaluation.
+        state_dict = self.accelerator.get_state_dict(self.model)
+        if self.accelerator.is_main_process:
+            torch.save(state_dict, checkpoint_path + "_pytorch_model.pt")
+
+            trainer_state = {
+                "completed_steps": self.completed_steps,
+                "micro_batches_consumed": self.micro_batches_consumed,
+                "main_process_eval_batches_consumed": self.main_process_eval_batches_consumed,
+                "vla_epoch_count": self.vla_epoch_count,
+                "wandb_run_id": self.wandb_run_id,
+                "num_processes": self.accelerator.num_processes,
+                "gradient_accumulation_steps": int(
+                    self.config.trainer.gradient_accumulation_steps
+                ),
+                "per_device_batch_size": int(
+                    self.config.datasets.vla_data.per_device_batch_size
+                ),
+                "batches_per_epoch": len(self.vla_train_dataloader),
+            }
+            with open(os.path.join(state_checkpoint_path, "trainer_state.json"), "w") as f:
+                json.dump(trainer_state, f, indent=2)
+
+            summary_data = {"steps": self.completed_steps}
+            with open(os.path.join(self.config.output_dir, "summary.jsonl"), "a") as f:
+                f.write(json.dumps(summary_data) + "\n")
+            self.accelerator.print(
+                f"✅ Model saved at {checkpoint_path}_pytorch_model.pt; "
+                f"resumable state saved at {state_checkpoint_path}"
+            )
+        self.accelerator.wait_for_everyone()
+
+    def _log_metrics(self, metrics):
+        """record training metrics"""
+        if self.completed_steps % self.config.trainer.logging_frequency == 0:
+            if dist.get_rank() == 0:
+                # add learning rate
+                metrics["learning_rate"] = self.lr_scheduler.get_last_lr()[0]
+
+                # add epoch info
+                metrics["epoch"] = round(self.completed_steps / len(self.vla_train_dataloader), 2)
+
+                # record to W&B
+                wandb.log(metrics, step=self.completed_steps)
+                # debug output
+                logger.info(f"Step {self.completed_steps}, Loss: {metrics})")
+
+    def _create_data_iterators(self):
+        """Create the data iterator at the saved micro-batch offset."""
+        batches_per_epoch = len(self.vla_train_dataloader)
+        if batches_per_epoch <= 0:
+            raise ValueError("The training dataloader is empty.")
+
+        local_batches_consumed = self.micro_batches_consumed
+        if self.accelerator.is_main_process:
+            local_batches_consumed += self.main_process_eval_batches_consumed
+
+        self.vla_epoch_count = local_batches_consumed // batches_per_epoch
+        batches_to_skip = local_batches_consumed % batches_per_epoch
+
+        if hasattr(self.vla_train_dataloader, "set_epoch"):
+            self.vla_train_dataloader.set_epoch(self.vla_epoch_count)
+        elif (
+            hasattr(self.vla_train_dataloader, "sampler")
+            and hasattr(self.vla_train_dataloader.sampler, "set_epoch")
+        ):
+            self.vla_train_dataloader.sampler.set_epoch(self.vla_epoch_count)
+
+        if batches_to_skip:
+            resume_dataloader = self.accelerator.skip_first_batches(
+                self.vla_train_dataloader, batches_to_skip
+            )
+            self.vla_iter = iter(resume_dataloader)
+            self.accelerator.print(
+                f"Skipping {batches_to_skip} previously consumed batches in "
+                f"dataloader epoch {self.vla_epoch_count}"
+            )
+        else:
+            self.vla_iter = iter(self.vla_train_dataloader)
+
+    def _get_next_batch(self):
+        """get next batch (automatically handle data loop)"""
+        try:
+            batch_vla = next(self.vla_iter)
+        except StopIteration:
+            if not hasattr(self, "vla_epoch_count"):
+                self.vla_epoch_count = 0
+            self.vla_iter, self.vla_epoch_count = TrainerUtils._reset_dataloader(
+                self.vla_train_dataloader, self.vla_epoch_count
+            )
+            batch_vla = next(self.vla_iter)
+
+        return batch_vla
+
+    import torch
+
+    def compare_state_dict(self, sd1, sd2, verbose=True):
+        # 1. key 完全一致
+        keys1 = set(sd1.keys())
+        keys2 = set(sd2.keys())
+
+        if keys1 != keys2:
+            missing_1 = keys2 - keys1
+            missing_2 = keys1 - keys2
+            if verbose:
+                if missing_1:
+                    print("❌ sd1 缺少 keys:", missing_1)
+                if missing_2:
+                    print("❌ sd2 缺少 keys:", missing_2)
+            return False
+
+        # 2. 逐 tensor 比较
+        for k in keys1:
+            t1 = sd1[k]
+            t2 = sd2[k]
+
+            # 允许 Parameter
+            if isinstance(t1, torch.nn.Parameter):
+                t1 = t1.data
+            if isinstance(t2, torch.nn.Parameter):
+                t2 = t2.data
+
+            # shape
+            if t1.shape != t2.shape:
+                if verbose:
+                    print(f"❌ [{k}] shape 不一致: {t1.shape} vs {t2.shape}")
+                return False
+
+            # dtype
+            if t1.dtype != t2.dtype:
+                if verbose:
+                    print(f"❌ [{k}] dtype 不一致: {t1.dtype} vs {t2.dtype}")
+                return False
+
+            # device 无所谓，统一搬到 CPU 比
+            t1_cpu = t1.detach().cpu()
+            t2_cpu = t2.detach().cpu()
+
+            # 数值完全一致（bit 级）
+            if not torch.equal(t1_cpu, t2_cpu):
+                if verbose:
+                    max_diff = (t1_cpu - t2_cpu).abs().max().item()
+                    print(f"❌ [{k}] 数值不一致, max diff = {max_diff}")
+                return False
+
+        if verbose:
+            print("✅ 两个 state_dict 完全一致")
+
+        return True
+
+
+    def train(self):
+        """execute training loop"""
+        # print training config
+        self._log_training_config()
+
+        # prepare data iterators
+        self._create_data_iterators()
+
+        # create progress bar
+        progress_bar = tqdm(
+            total=self.config.trainer.max_train_steps,
+            initial=min(self.completed_steps, self.config.trainer.max_train_steps),
+            disable=not self.accelerator.is_local_main_process,
+        )
+
+        # main training loop
+        while self.completed_steps < self.config.trainer.max_train_steps:
+            # get data batch
+            t_start_data = time.perf_counter()
+            batch_vla = self._get_next_batch()
+            t_end_data = time.perf_counter()
+
+            # execute training step
+            t_start_model = time.perf_counter()
+            step_metrics = self._train_step(batch_vla)
+            t_end_model = time.perf_counter()
+            self.micro_batches_consumed += 1
+
+            # Logging, evaluation, and checkpointing are optimizer-step events.
+            # Running them on accumulation micro-batches duplicates work and can
+            # write the same checkpoint multiple times.
+            if not self.accelerator.sync_gradients:
+                continue
+
+            progress_bar.update(1)
+            self.completed_steps += 1
+
+            if self.accelerator.is_local_main_process:
+                progress_bar.set_postfix(
+                    {
+                        "data_times": f"{t_end_data - t_start_data:.3f}",
+                        "model_times": f"{t_end_model - t_start_model:.3f}",
+                    }
+                )
+
+            # evaluate model
+            if self.completed_steps % self.config.trainer.eval_interval == 0:
+                step_metrics = self.eval_action_model(step_metrics)
+
+            # record metrics
+            step_metrics["data_time"] = t_end_data - t_start_data
+            step_metrics["model_time"] = t_end_model - t_start_model
+            self._log_metrics(step_metrics)
+
+            # save checkpoint
+            if self.completed_steps % self.config.trainer.save_interval == 0 and self.completed_steps > 0:
+                self._save_checkpoint()
+
+            # check termination condition
+            if self.completed_steps >= self.config.trainer.max_train_steps:
+                break
+
+        progress_bar.close()
+
+        # training end processing
+        self._finalize_training()
+
+        # execute evaluation step
+
+    def eval_action_model(self, step_metrics: dict = None) -> float:
+        """
+        Evaluate the model on the given dataset using the specified metric function.
+
+        :param eval_dataset: List of evaluation samples, each containing 'image', 'instruction', and 'action'.
+        :param metric_fn: Function to compute the distance between predicted and ground truth actions.
+        :return: Average metric score across the evaluation dataset.
+        """
+
+        if self.accelerator.is_main_process:
+
+            examples = self._get_next_batch()
+            self.main_process_eval_batches_consumed += 1
+
+            score = 0.0
+            num_samples = len(examples)
+
+            batch_images = [example["image"] for example in examples]
+            instructions = [example["lang"] for example in examples]  # [B, str]
+            actions = [example["action"] for example in examples]  # label
+            state = [example["state"] for example in examples] if "state" in examples[0] else None  # [B, 1, state_dim]
+
+
+            # Predict actions using the model
+            output_dict = self.model.predict_action(
+                batch_images=batch_images, 
+                instructions=instructions, 
+                state=state,
+                use_ddim=True,
+                num_ddim_steps=20
+            )
+
+            normalized_actions = output_dict["normalized_actions"]  # B, T, D
+            mae_score = np.mean(np.abs(normalized_actions - actions))
+
+            actions = np.array(actions)  # convert actions to numpy.ndarray
+            # B, Chunk, dim = actions.shape
+            num_pots = np.prod(actions.shape)
+            # Compute the metric score
+            score = TrainerUtils.euclidean_distance(normalized_actions, actions)
+            average_score = score / num_pots
+            step_metrics["mse_score"] = average_score
+            step_metrics["mae_score"] = mae_score
+            self.writer.add_scalar("mae_score", step_metrics["mae_score"], self.completed_steps)
+            self.writer.add_scalar("mse_score", step_metrics["mse_score"], self.completed_steps)
+        
+        pass
+        dist.barrier()  # ensure all processes are synchronized
+        return step_metrics
+
+    def _log_training_config(self):
+        """record training config"""
+        if self.accelerator.is_main_process:
+            logger.info("***** Training Configuration *****")
+            logger.info(f"  Total optimization steps = {self.config.trainer.max_train_steps}")
+            logger.info(f"  Per device batch size = {self.config.datasets.vla_data.per_device_batch_size}")
+            logger.info(f"  Gradient accumulation steps = {self.config.trainer.gradient_accumulation_steps}")
+            logger.info(f"  Total batch size = {self.total_batch_size}")
+
+    def _train_step(self, batch_vla, batch_vlm=None):
+        """execute single training step"""
+        with self.accelerator.accumulate(self.model):
+            self.optimizer.zero_grad()
+            # VLA task forward propagation
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                output_dict = self.model.forward(batch_vla)
+
+                total_loss = sum(output_dict.values())
+
+            # VLA backward propagation
+            self.accelerator.backward(total_loss)
+
+            # gradient clipping
+            if self.config.trainer.gradient_clipping is not None:
+                self.accelerator.clip_grad_norm_(self.model.parameters(), self.config.trainer.gradient_clipping)
+
+            # optimizer step
+            self.optimizer.step()
+            self.lr_scheduler.step()
+            
+            result_dict = {k: v.item() for k, v in output_dict.items()}
+
+        return result_dict
+
+    def _finalize_training(self):
+        """training end processing"""
+        # save final model
+        if self.accelerator.is_main_process:
+            final_checkpoint = os.path.join(self.config.output_dir, "final_model")
+            os.makedirs(final_checkpoint, exist_ok=True)
+            state_dict = self.accelerator.get_state_dict(self.model)
+            torch.save(state_dict, os.path.join(final_checkpoint, "pytorch_model.pt"))
+            logger.info(f"Training complete. Final model saved at {final_checkpoint}")
+
+        # close W&B
+        if self.accelerator.is_main_process:
+            wandb.finish()
+
+        self.accelerator.wait_for_everyone()
+
+
+def main(cfg) -> None:
+    logger.info("VLA Training :: Warming Up")
+
+    validate_config(cfg)
+
+    # create output directory and save config
+    output_dir = setup_directories(cfg=cfg)
+    # build model
+    vla = build_framework(cfg)
+    # prepare data
+    vla_train_dataloader = prepare_data(cfg=cfg, accelerator=accelerator, output_dir=output_dir)
+
+    # set optimizer and scheduler
+    optimizer, lr_scheduler = setup_optimizer_and_scheduler(model=vla, cfg=cfg)
+
+    # create trainer
+    # Run VLA Training
+    trainer = VLATrainer(
+        cfg=cfg,
+        model=vla,
+        vla_train_dataloader=vla_train_dataloader,
+        optimizer=optimizer,
+        lr_scheduler=lr_scheduler,
+        accelerator=accelerator,
+    )
+
+    # execute training preparation
+    trainer.prepare_training()
+    # execute training
+    trainer.train()
+
+    # And... we're done!
+    logger.info("... and that's all, folks!")
+    dist.barrier()
+    dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config_yaml", type=str, default="starVLA/config/training/starvla_cotrain_oxe.yaml", help="Path to YAML config")
+    args, clipargs = parser.parse_known_args()
+
+    # Load YAML config & Convert CLI overrides to dotlist config
+    cfg = OmegaConf.load(args.config_yaml)
+    dotlist = normalize_dotlist_args(clipargs)  # Normalize CLI args to dotlist format
+    cli_cfg = OmegaConf.from_dotlist(dotlist)
+    cfg = OmegaConf.merge(cfg, cli_cfg)
+
+    # Accelerator must be created after the YAML and CLI overrides are merged.
+    # ZeRO-2 partitions gradients and therefore cannot use DeepSpeed's no_sync
+    # context. Syncing each micro-batch keeps Accelerate's accumulation counters
+    # and DeepSpeed's optimizer boundaries aligned without entering no_sync.
+    gradient_accumulation_plugin = GradientAccumulationPlugin(
+        num_steps=int(cfg.trainer.get("gradient_accumulation_steps", 1)),
+        sync_each_batch=True,
+    )
+    accelerator = Accelerator(
+        deepspeed_plugin=deepspeed_plugin,
+        gradient_accumulation_plugin=gradient_accumulation_plugin,
+    )
+    accelerator.print(accelerator.state)
+
+    # if cfg.is_debug:
+    if cfg.is_debug and dist.is_initialized() and dist.get_rank() == 0:
+        import debugpy
+        debugpy.listen(("0.0.0.0", 10092))
+        print("🔍 Rank 0 waiting for debugger attach on port 10092...")
+        debugpy.wait_for_client()
+
+    main(cfg)

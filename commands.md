@@ -1,0 +1,1 @@
+source ~/conda_envs/VLA_JEPA/bin/activate
