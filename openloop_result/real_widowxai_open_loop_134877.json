@@ -1,0 +1,137 @@
+{
+  "checkpoint": "/po2/heimrih/VLA-JEPA/checkpoints/real_widowxai_ft/final_model/pytorch_model.pt",
+  "evaluation_dataset": "/po2/heimrih/VLA-JEPA/checkpoints/vla-jepa-pretrain/vla-jepa/real_widowxai_test/real_widowxai_test",
+  "normalization_dataset": "/po2/heimrih/VLA-JEPA/checkpoints/vla-jepa-pretrain/vla-jepa/real_widowxai_success_only/real_widowxai_success_only",
+  "dataset_size": 988,
+  "sampling": {
+    "mode": "unique_valid_frames_without_replacement",
+    "valid_steps": 988,
+    "excluded_incomplete_tail_steps": 12
+  },
+  "evaluated_examples": 988,
+  "samples_per_example": 3,
+  "seed": 42,
+  "action_shape": [
+    7,
+    14
+  ],
+  "metric_space": "raw_robot_units",
+  "visualization_directories": [
+    "/po2/heimrih/VLA-JEPA/results/real_widowxai_open_loop_134877_visualizations/example_00000",
+    "/po2/heimrih/VLA-JEPA/results/real_widowxai_open_loop_134877_visualizations/example_00001",
+    "/po2/heimrih/VLA-JEPA/results/real_widowxai_open_loop_134877_visualizations/example_00002",
+    "/po2/heimrih/VLA-JEPA/results/real_widowxai_open_loop_134877_visualizations/example_00003",
+    "/po2/heimrih/VLA-JEPA/results/real_widowxai_open_loop_134877_visualizations/example_00004",
+    "/po2/heimrih/VLA-JEPA/results/real_widowxai_open_loop_134877_visualizations/example_00005",
+    "/po2/heimrih/VLA-JEPA/results/real_widowxai_open_loop_134877_visualizations/example_00006",
+    "/po2/heimrih/VLA-JEPA/results/real_widowxai_open_loop_134877_visualizations/example_00007",
+    "/po2/heimrih/VLA-JEPA/results/real_widowxai_open_loop_134877_visualizations/example_00008",
+    "/po2/heimrih/VLA-JEPA/results/real_widowxai_open_loop_134877_visualizations/example_00009",
+    "/po2/heimrih/VLA-JEPA/results/real_widowxai_open_loop_134877_visualizations/example_00010",
+    "/po2/heimrih/VLA-JEPA/results/real_widowxai_open_loop_134877_visualizations/example_00011",
+    "/po2/heimrih/VLA-JEPA/results/real_widowxai_open_loop_134877_visualizations/example_00012",
+    "/po2/heimrih/VLA-JEPA/results/real_widowxai_open_loop_134877_visualizations/example_00013",
+    "/po2/heimrih/VLA-JEPA/results/real_widowxai_open_loop_134877_visualizations/example_00014",
+    "/po2/heimrih/VLA-JEPA/results/real_widowxai_open_loop_134877_visualizations/example_00015",
+    "/po2/heimrih/VLA-JEPA/results/real_widowxai_open_loop_134877_visualizations/example_00016",
+    "/po2/heimrih/VLA-JEPA/results/real_widowxai_open_loop_134877_visualizations/example_00017",
+    "/po2/heimrih/VLA-JEPA/results/real_widowxai_open_loop_134877_visualizations/example_00018",
+    "/po2/heimrih/VLA-JEPA/results/real_widowxai_open_loop_134877_visualizations/example_00019",
+    "/po2/heimrih/VLA-JEPA/results/real_widowxai_open_loop_134877_visualizations/example_00020",
+    "/po2/heimrih/VLA-JEPA/results/real_widowxai_open_loop_134877_visualizations/example_00021",
+    "/po2/heimrih/VLA-JEPA/results/real_widowxai_open_loop_134877_visualizations/example_00022",
+    "/po2/heimrih/VLA-JEPA/results/real_widowxai_open_loop_134877_visualizations/example_00023",
+    "/po2/heimrih/VLA-JEPA/results/real_widowxai_open_loop_134877_visualizations/example_00024",
+    "/po2/heimrih/VLA-JEPA/results/real_widowxai_open_loop_134877_visualizations/example_00025",
+    "/po2/heimrih/VLA-JEPA/results/real_widowxai_open_loop_134877_visualizations/example_00026",
+    "/po2/heimrih/VLA-JEPA/results/real_widowxai_open_loop_134877_visualizations/example_00027",
+    "/po2/heimrih/VLA-JEPA/results/real_widowxai_open_loop_134877_visualizations/example_00028",
+    "/po2/heimrih/VLA-JEPA/results/real_widowxai_open_loop_134877_visualizations/example_00029",
+    "/po2/heimrih/VLA-JEPA/results/real_widowxai_open_loop_134877_visualizations/example_00030",
+    "/po2/heimrih/VLA-JEPA/results/real_widowxai_open_loop_134877_visualizations/example_00031"
+  ],
+  "raw_unit_metrics": {
+    "expected_sample_mae": 0.06895706593775278,
+    "expected_sample_mse": 0.015502472075895026,
+    "expected_sample_rmse": 0.12450892367977094,
+    "mean_prediction_mae": 0.06860348749833492,
+    "mean_prediction_mse": 0.014950847870859632,
+    "mean_prediction_rmse": 0.12227365975899974,
+    "mean_sample_std": 0.003721873735325534,
+    "per_horizon_mae": [
+      0.06403472941451052,
+      0.0656602922045068,
+      0.06714762079884792,
+      0.06847052231552382,
+      0.06963417452228754,
+      0.07122233172320942,
+      0.07652979008372243
+    ],
+    "per_horizon_rmse": [
+      0.11587281171557108,
+      0.1175880622204279,
+      0.11894098381814422,
+      0.12014664203962265,
+      0.12105761199631966,
+      0.1262054818849568,
+      0.1486569946256153
+    ],
+    "per_dimension_mae": [
+      0.06312595922316755,
+      0.1499597816964163,
+      0.13676375171651908,
+      0.0771925805884564,
+      0.06797160973509546,
+      0.014627739002830103,
+      9.46130985010109e-05,
+      0.03164047506392427,
+      0.12952098011947538,
+      0.14691495928422826,
+      0.08112680294080715,
+      0.029673915530919616,
+      0.0360116104192993,
+      0.0007741439970852555
+    ],
+    "per_dimension_rmse": [
+      0.08857301597349888,
+      0.20319787635624598,
+      0.19064534597792535,
+      0.1035642641010644,
+      0.08744096075728458,
+      0.018187210283945012,
+      0.00018343557305758546,
+      0.043424268239256575,
+      0.20542129120773506,
+      0.23276255370472987,
+      0.10512373334180465,
+      0.04170923788277149,
+      0.0424026242712571,
+      0.0012237332849426635
+    ]
+  },
+  "raw_unit_baselines": {
+    "zero": {
+      "mae": 0.49947396075637895,
+      "mse": 0.5267635007973477,
+      "rmse": 0.7257847482534665
+    },
+    "current_state_persistence": {
+      "mae": 0.012322972039774826,
+      "mse": 0.0008650089555242466,
+      "rmse": 0.029411034587791138,
+      "per_horizon_mae": [
+        0.00777333074100795,
+        0.009308794117808728,
+        0.01083409301165013,
+        0.012348464713916677,
+        0.013849581337610379,
+        0.015336467982817898,
+        0.016810070917747177
+      ]
+    }
+  },
+  "relative_to_persistence": {
+    "mae_improvement_fraction": -4.595814525520323,
+    "interpretation": "positive means the policy beats persistence; negative means it is worse"
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "instruction": "pick the brown cap and put it in the light blue bucket",
+  "values_are_normalized": false,
+  "value_space": "raw_robot_units",
+  "action_dimension_names": [
+    "left_joint_0",
+    "left_joint_1",
+    "left_joint_2",
+    "left_joint_3",
+    "left_joint_4",
+    "left_joint_5",
+    "left_gripper",
+    "right_joint_0",
+    "right_joint_1",
+    "right_joint_2",
+    "right_joint_3",
+    "right_joint_4",
+    "right_joint_5",
+    "right_gripper"
+  ]
+}
